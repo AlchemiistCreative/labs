@@ -1,0 +1,139 @@
+- name: Add Kubernetes YUM repository
+  yum_repository:
+    name: kubernetes
+    description: Kubernetes repository
+    baseurl: https://pkgs.k8s.io/core:/stable:/v1.29/rpm/
+    gpgcheck: yes
+    enabled: yes
+    gpgkey: https://pkgs.k8s.io/core:/stable:/v1.29/rpm/repodata/repomd.xml.key
+
+- name: Install Kubernetes packages
+  yum:
+    name:
+      - kubelet
+      - kubeadm
+      - kubectl
+    state: present
+    update_cache: yes
+
+- name: Enable and start kubelet service
+  systemd:
+    name: kubelet
+    enabled: yes
+    state: started
+
+- name: Check if lock file exists
+  stat:
+    path: /tmp/kubeadm.lock
+  register: lock_file_stat
+
+- name: Get correct IP address (on the desired NIC)
+  shell: ip -o -4 addr show dev ens3 | awk '{print $4}' | cut -d/ -f1
+  register: correct_ip
+  when: inventory_hostname == "kubemaster"
+
+- name: Initialize Kubernetes with correct network interface
+  become: true
+  command: kubeadm init --apiserver-advertise-address={{ correct_ip.stdout }} --pod-network-cidr=10.244.0.0/16
+  when: inventory_hostname == "kubemaster" and not lock_file_stat.stat.exists
+  register: kubeadm_init
+  notify: lockfile
+
+- name: Set up kubeconfig for vagrant user
+  become: true
+  shell: |
+    mkdir -p /home/{{ user }}/.kube
+    mkdir -p /root/.kube
+    cp -i /etc/kubernetes/admin.conf /home/{{ user }}/.kube/config
+    cp -i /etc/kubernetes/admin.conf /root/.kube/config
+    chown {{ user }}:{{ user }} /home/{{ user }}/.kube/config
+  when: inventory_hostname == "kubemaster" and not lock_file_stat.stat.exists
+
+- name: Retrieve join command from master
+  command: kubeadm token create --print-join-command
+  register: join_cmd
+  run_once: true
+  delegate_to: kubemaster
+
+- name: Distribute join command to all hosts
+  set_fact:
+    join_command_str: "{{ join_cmd.stdout }}"
+
+- name: Join worker nodes to the Kubernetes cluster
+  become: true
+  command: "{{ join_command_str }} -cri-socket /run/containerd/containerd.sock"
+  when:
+    - inventory_hostname in groups['workers']
+    - not (lock_file_stat.stat.exists | default(false))
+
+- name: Ensure Flannel directory exists
+  file:
+    path: /run/flannel
+    state: directory
+    mode: '0755'  # Set the desired permissions
+
+
+- name: Ensure subnet.env file exists
+  file:
+    path: /run/flannel/subnet.env
+    state: touch  # Create the file if it doesn't exist
+    mode: '0644'  # Set desired permissions for the file
+
+- name: Add Flannel configuration to subnet.env
+  blockinfile:
+    path: /run/flannel/subnet.env
+    block: |
+      FLANNELD_IFACE=eth1
+      FLANNEL_NETWORK=10.244.0.0/16
+      FLANNEL_SUBNET=10.244.0.1/24
+      FLANNEL_MTU=1450
+      FLANNEL_IPMASQ=true
+    marker: ""
+
+- name: Download kube-flannel.yml to /tmp
+  get_url:
+    url: https://github.com/flannel-io/flannel/releases/download/v0.24.1/kube-flannel.yml
+    dest: /tmp/kube-flannel.yml
+    mode: '0644'
+
+- name: Modify Flannel configuration to use the correct network interface
+  lineinfile:
+    path: /tmp/kube-flannel.yml
+    insertafter: '^(\s*)- --ip-masq'  # Insert after the --ip-masq line
+    line: '        - --iface=eth1'    # Indentation must match the original file
+
+# - name: Replace cbr0 with cni0 in the ConfigMap
+#   replace:
+#     path: /tmp/kube-flannel.yml
+#     regexp: '"name": "cbr0"'
+#     replace: '"name": "cni0"'
+
+- name: Apply the Flannel CNI plugin
+  command: kubectl apply -f /tmp/kube-flannel.yml
+  become: true
+  when: inventory_hostname == "kubemaster" and not lock_file_stat.stat.exists
+
+- name: Restart containerd
+  systemd:
+    name: containerd
+    state: restarted
+
+- name: Restart kubelet
+  systemd:
+    name: kubelet
+    state: restarted
+
+- name: Create LAB dir if it does not exist
+  ansible.builtin.file:
+    path: /home/{{ user }}/lab 
+    state: directory
+    mode: '0755'
+  when: inventory_hostname == "kubemaster"
+
+- name: Copy all files
+  copy:
+    src: "{{ item }}"
+    dest: /home/{{ user }}/lab 
+  with_fileglob:
+    - "{{ role_path }}/files/*"
+  when: inventory_hostname == "kubemaster"

@@ -1,0 +1,16 @@
+---
+# handlers file for k8s4vagrant
+- name: Restart containerd
+  systemd:
+    name: containerd
+    state: restarted
+
+- name: lockfile
+  file:
+    path: /tmp/kubeadm.lock
+    state: touch
+
+- name: Restart kubelet
+  systemd:
+    name: kubelet
+    state: restarted

@@ -1,0 +1,201 @@
+# --- Paquets de base -----------------------------------------------------------
+- name: Clear YUM cache
+  command: yum clean all
+  become: true
+
+- name: Install dependencies
+  yum:
+    name:
+      - yum-utils
+      - ca-certificates
+      - curl
+      - socat
+    state: present
+    update_cache: yes
+  become: true
+
+# --- Firewalld -----------------------------------------------------------------
+- name: Install firewalld
+  package:
+    name: firewalld
+    state: present
+  become: true
+
+- name: Unmask firewalld if needed
+  ansible.builtin.systemd:
+    name: firewalld
+    masked: no
+  become: true
+
+- name: Enable and start firewalld
+  ansible.builtin.systemd:
+    name: firewalld
+    state: started
+    enabled: true
+  become: true
+
+# Master rules
+- name: FirewallD rules for Master
+  firewalld:
+    permanent: yes
+    immediate: yes
+    port: "{{ item.port }}/{{ item.proto }}"
+    state: "{{ item.state }}"
+    zone: "{{ item.zone }}"
+  loop:
+    - { port: "6443", proto: "tcp", state: "enabled", zone: "public" }
+    - { port: "2379-2380", proto: "tcp", state: "enabled", zone: "public" }
+    - { port: "10250", proto: "tcp", state: "enabled", zone: "public" }
+    - { port: "10251", proto: "tcp", state: "enabled", zone: "public" }
+    - { port: "10252", proto: "tcp", state: "enabled", zone: "public" }
+    - { port: "8285", proto: "udp", state: "enabled", zone: "public" }
+    - { port: "8472", proto: "udp", state: "enabled", zone: "public" }
+    - { port: "30000-32767", proto: "tcp", state: "enabled", zone: "public" }
+    - { port: "4789", proto: "udp", state: "enabled", zone: "public" }
+    - { port: "6444", proto: "tcp", state: "enabled", zone: "public" }
+  when: inventory_hostname == "kubemaster"
+  become: true
+
+# Worker rules
+- name: FirewallD rules for Worker nodes
+  firewalld:
+    permanent: yes
+    immediate: yes
+    port: "{{ item.port }}/{{ item.proto }}"
+    state: "{{ item.state }}"
+    zone: "{{ item.zone }}"
+  loop:
+    - { port: "10250", proto: "tcp", state: "enabled", zone: "public" }
+    - { port: "8285", proto: "udp", state: "enabled", zone: "public" }
+    - { port: "8472", proto: "udp", state: "enabled", zone: "public" }
+    - { port: "30000-32767", proto: "tcp", state: "enabled", zone: "public" }
+    - { port: "4789", proto: "udp", state: "enabled", zone: "public" }
+  when: inventory_hostname != "kubemaster"
+  become: true
+
+- name: Add masquerading rule to FirewallD
+  firewalld:
+    permanent: yes
+    immediate: yes
+    masquerade: yes
+    state: enabled
+    zone: public
+  become: true
+
+- name: Reload & restart firewalld
+  block:
+    - command: firewall-cmd --reload
+    - systemd:
+        name: firewalld
+        state: restarted
+        enabled: yes
+  become: true
+
+# --- SELinux & sysctl ----------------------------------------------------------
+- name: Put SELinux in permissive mode
+  ansible.posix.selinux:
+    policy: targeted
+    state: permissive
+  become: true
+
+- name: Enable IP forwarding
+  sysctl:
+    name: net.ipv4.ip_forward
+    value: 1
+    sysctl_set: yes
+    state: present
+    reload: yes
+  become: true
+
+# --- Bridge netfilter (module + sysctl) ----------------------------------------
+- name: Ensure modules-load.d for k8s exists
+  file:
+    path: /etc/modules-load.d
+    state: directory
+    mode: '0755'
+  become: true
+
+- name: Load br_netfilter at boot
+  copy:
+    dest: /etc/modules-load.d/k8s.conf
+    content: |
+      br_netfilter
+  become: true
+
+- name: Try to load br_netfilter now (best-effort)
+  modprobe:
+    name: br_netfilter
+    state: present
+  ignore_errors: true
+  become: true
+
+- name: Apply sysctl settings for Kubernetes
+  ansible.builtin.sysctl:
+    name: "{{ item }}"
+    value: 1
+    state: present
+    reload: yes
+  loop:
+    - net.bridge.bridge-nf-call-iptables
+    - net.bridge.bridge-nf-call-ip6tables
+  become: true
+
+# --- Swap off & fstab -----------------------------------------------------------
+- name: Disable swap
+  command: swapoff -a
+  become: true
+
+- name: Remove any swap entries from /etc/fstab
+  lineinfile:
+    path: /etc/fstab
+    regexp: '^\S+\s+\S+\s+swap\s+'
+    state: absent
+  become: true
+
+# --- Docker repo (pour containerd.io) ------------------------------------------
+- name: Add Docker repository
+  yum_repository:
+    name: docker-ce
+    description: Docker CE
+    baseurl: https://download.docker.com/linux/centos/9/x86_64/stable/
+    gpgcheck: yes
+    gpgkey: https://download.docker.com/linux/centos/gpg
+    enabled: yes
+  become: true
+
+# --- containerd ----------------------------------------------------------------
+- name: Install containerd
+  yum:
+    name: containerd.io
+    state: present
+    update_cache: yes
+  become: true
+
+- name: Ensure /etc/containerd exists
+  file:
+    path: /etc/containerd
+    state: directory
+    mode: '0755'
+  become: true
+
+- name: Generate default containerd config (idempotent)
+  shell: "containerd config default | tee /etc/containerd/config.toml >/dev/null"
+  args:
+    executable: /bin/bash
+    creates: /etc/containerd/config.toml
+  become: true
+
+- name: Use systemd cgroups for containerd
+  replace:
+    path: /etc/containerd/config.toml
+    regexp: 'SystemdCgroup = false'
+    replace: 'SystemdCgroup = true'
+  become: true
+
+- name: Ensure containerd service is enabled and started
+  systemd:
+    name: containerd
+    enabled: yes
+    state: started
+  become: true
+

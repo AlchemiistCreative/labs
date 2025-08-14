@@ -1,0 +1,94 @@
+---
+- name: Pre-Req Kernel modules & upgrade kernel
+  hosts: all
+  become: true
+  serial: 1
+
+  tasks:
+    - name: Installer les paquets kernel modules
+      package:
+        name:
+          - "kernel-modules-{{ ansible_kernel }}"
+          - "kernel-modules-extra-{{ ansible_kernel }}"
+        state: present
+      ignore_errors: yes
+
+    - name: Installer dernier kernel si besoin
+      package:
+        name: kernel
+        state: latest
+      register: kpkg
+    
+    - name: Reboot si nécessaire
+      reboot:
+        reboot_timeout: 900
+      when: kpkg is defined and kpkg.changed
+
+    - name: Attendre que la machine soit de nouveau dispo
+      wait_for_connection:
+        timeout: 300
+      when: kpkg is defined and kpkg.changed
+
+    - name: Recalculer les dépendances de modules
+      command: depmod -a
+
+- hosts: all
+  become: true
+  tasks:
+    - name: Install chrony
+      yum: { name: chrony, state: present }
+
+    - name: Push minimal /etc/chrony.conf
+      copy:
+        dest: /etc/chrony.conf
+        content: |
+          # Serveurs publics fiables
+          pool 0.pool.ntp.org iburst
+          pool 1.pool.ntp.org iburst
+          pool 2.pool.ntp.org iburst
+          pool 3.pool.ntp.org iburst
+          # Step agressif au démarrage si gros décalage
+          makestep 1.0 3
+          # Écrit l'heure système dans la RTC
+          rtcsync
+          # Logs basiques
+          logdir /var/log/chrony
+      notify: Restart chronyd
+
+    - name: Ensure chronyd running
+      systemd:
+        name: chronyd
+        state: started
+        enabled: yes
+
+    # One-shot: ajuste tout de suite l’horloge
+    - name: Force immediate time step
+      command: chronyc -a makestep
+      changed_when: false
+
+    - name: Wait for chrony sync (source with *)
+      shell: chronyc -a sources -v | grep -q '^\^\*'
+      register: chrony_ok
+      retries: 20
+      delay: 3
+      until: chrony_ok.rc == 0
+      changed_when: false
+
+    - name: Show UTC time (debug)
+      command: date -u +"%F %T %Z"
+      register: now
+    - debug: var=now.stdout
+
+  handlers:
+    - name: Restart chronyd
+      systemd:
+        name: chronyd
+        state: restarted
+
+- name: Setup Kubernetes cluster
+  hosts: all
+  become: true
+  vars:
+    user: alchemist
+  roles:
+    - k8s

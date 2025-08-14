@@ -1,0 +1,208 @@
+# --- Repo + packages -----------------------------------------------------------
+- name: Add Kubernetes YUM repository
+  yum_repository:
+    name: kubernetes
+    description: Kubernetes repository
+    baseurl: https://pkgs.k8s.io/core:/stable:/v1.29/rpm/
+    gpgcheck: yes
+    enabled: yes
+    gpgkey: https://pkgs.k8s.io/core:/stable:/v1.29/rpm/repodata/repomd.xml.key
+
+- name: Install Kubernetes packages
+  yum:
+    name: [kubelet, kubeadm, kubectl]
+    state: present
+    update_cache: yes
+
+- name: Enable and start kubelet service
+  systemd:
+    name: kubelet
+    enabled: yes
+    state: started
+# --- CNI plugins (fix si RPM vide) ---------------------------------------------
+- name: Check CNI loopback exists
+  stat:
+    path: /opt/cni/bin/loopback
+  register: cni_loopback
+
+- name: Install CNI plugins from upstream tarball when missing
+  when: not cni_loopback.stat.exists
+  block:
+    - get_url:
+        url: https://github.com/containernetworking/plugins/releases/download/v1.5.1/cni-plugins-linux-amd64-v1.5.1.tgz
+        dest: /tmp/cni-plugins.tgz
+        mode: '0644'
+    - file:
+        path: /opt/cni/bin
+        state: directory
+        mode: '0755'
+    - unarchive:
+        src: /tmp/cni-plugins.tgz
+        dest: /opt/cni/bin
+        remote_src: true
+    - file:
+        path: /opt/cni/bin
+        state: directory
+        mode: '0755'
+        recurse: true
+    - systemd:
+        name: containerd
+        state: restarted
+    - systemd:
+        name: kubelet
+        state: restarted
+
+# --- Idempotence / locks -------------------------------------------------------
+- name: Check if lock file exists
+  stat:
+    path: /tmp/kubeadm.lock
+  register: lock_file_stat
+
+- name: Check if cluster already initialized
+  stat:
+    path: /etc/kubernetes/admin.conf
+  register: admin_conf
+  when: inventory_hostname == "kubemaster"
+
+# --- IP d'API (sans dépendre d'un nom d'interface) -----------------------------
+- name: Resolve API interface and address
+  set_fact:
+    api_iface: "{{ api_iface | default(ansible_facts.default_ipv4.interface) }}"
+    advertise_address: "{{ api_advertise_ip | default(ansible_facts.default_ipv4.address) }}"
+  when: inventory_hostname == "kubemaster"
+
+# --- Hosts entries -------------------------------------------------------------
+- name: Ensure master hostname resolves on all nodes
+  lineinfile:
+    path: /etc/hosts
+    line: "{{ hostvars['kubemaster'].advertise_address }} kubemaster"
+    state: present
+  become: true
+
+- name: Ensure hostname resolves to advertise IP (master)
+  lineinfile:
+    path: /etc/hosts
+    line: "{{ advertise_address }} {{ inventory_hostname }}"
+    state: present
+  when: inventory_hostname == "kubemaster"
+
+# --- Pre-clean control plane (free 6443) ---------------------------------------
+- name: Pre-clean control plane (free 6443)
+  when: inventory_hostname == "kubemaster"
+  become: true
+  block:
+    - systemd:
+        name: kubelet
+        state: stopped
+      ignore_errors: true
+
+    - systemd:
+        name: containerd
+        state: stopped
+      ignore_errors: true
+
+    - file:
+        path: "/etc/kubernetes/manifests/{{ item }}"
+        state: absent
+      loop:
+        - kube-apiserver.yaml
+        - kube-controller-manager.yaml
+        - kube-scheduler.yaml
+        - etcd.yaml
+
+    - shell: |
+        crictl ps -a | awk '/kube-apiserver|kube-controller-manager|kube-scheduler|etcd/ {print $1}' | xargs -r crictl stop
+        crictl ps -a | awk '/kube-apiserver|kube-controller-manager|kube-scheduler|etcd/ {print $1}' | xargs -r crictl rm
+      args: { executable: /bin/bash }
+      ignore_errors: true
+
+    # Au cas où un autre binaire écoute 6443 (haproxy, leftover)
+    - shell: "fuser -k 6443/tcp || true"
+      args: { executable: /bin/bash }
+
+    - shell: "ss -lntpn | grep -q ':6443 ' && echo busy || echo free"
+      register: ap6443
+      retries: 30
+      delay: 2
+      until: ap6443.stdout == "free"
+
+    - systemd:
+        name: containerd
+        state: started
+
+# --- kubeadm init (idempotent) -------------------------------------------------
+- name: Initialize Kubernetes (master)
+  become: true
+  command: "kubeadm init --apiserver-advertise-address={{ advertise_address }} --pod-network-cidr=10.244.0.0/16"
+  when:
+    - inventory_hostname == "kubemaster"
+    - not (admin_conf.stat.exists | default(false))
+    - not (lock_file_stat.stat.exists | default(false))
+  register: kubeadm_init
+  notify: lockfile
+
+- name: Set up kubeconfig for {{ user }} and root (master)
+  become: true
+  shell: |
+    mkdir -p /home/{{ user }}/.kube /root/.kube
+    cp -f /etc/kubernetes/admin.conf /home/{{ user }}/.kube/config
+    cp -f /etc/kubernetes/admin.conf /root/.kube/config
+    chown {{ user }}:{{ user }} /home/{{ user }}/.kube/config
+  when: inventory_hostname == "kubemaster" and not (lock_file_stat.stat.exists | default(false))
+
+# --- Join command (run once on master, only if init succeeded) ----------------
+- name: Retrieve join command from master
+  command: kubeadm token create --print-join-command
+  register: join_cmd
+  run_once: true
+  delegate_to: kubemaster
+
+- name: Distribute join command to all hosts
+  set_fact:
+    join_command_str: "{{ join_cmd.stdout }}"
+  when:
+    - join_cmd is defined
+    - (join_cmd.stdout | default('')) | length > 0
+
+- name: Join worker nodes to the Kubernetes cluster
+  become: true
+  command: "{{ join_command_str }} --cri-socket unix:///run/containerd/containerd.sock"
+  when:
+    - inventory_hostname in groups['workers']
+    - not (lock_file_stat.stat.exists | default(false))
+    - join_command_str is defined
+
+# --- Flannel (master uniquement) ----------------------------------------------
+- name: Apply Flannel CNI plugin
+  become: true
+  command: kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
+  when: inventory_hostname == "kubemaster" and not (lock_file_stat.stat.exists | default(false))
+
+
+# --- Services ------------------------------------------------------------------
+- name: Restart containerd
+  systemd:
+    name: containerd
+    state: restarted
+
+- name: Restart kubelet
+  systemd:
+    name: kubelet
+    state: restarted
+
+# --- Extra (lab files sur master) ---------------------------------------------
+- name: Create LAB dir if it does not exist (master)
+  ansible.builtin.file:
+    path: /home/{{ user }}/lab
+    state: directory
+    mode: '0755'
+  when: inventory_hostname == "kubemaster"
+
+- name: Copy all files (master)
+  copy:
+    src: "{{ item }}"
+    dest: /home/{{ user }}/lab
+  with_fileglob:
+    - "{{ role_path }}/files/*"
+  when: inventory_hostname == "kubemaster"
+

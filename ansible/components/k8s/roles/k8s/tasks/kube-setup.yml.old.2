@@ -1,0 +1,158 @@
+# --- Repo + packages -----------------------------------------------------------
+- name: Add Kubernetes YUM repository
+  yum_repository:
+    name: kubernetes
+    description: Kubernetes repository
+    baseurl: https://pkgs.k8s.io/core:/stable:/v1.29/rpm/
+    gpgcheck: yes
+    enabled: yes
+    gpgkey: https://pkgs.k8s.io/core:/stable:/v1.29/rpm/repodata/repomd.xml.key
+
+- name: Install Kubernetes packages
+  yum:
+    name: [kubelet, kubeadm, kubectl]
+    state: present
+    update_cache: yes
+
+- name: Enable and start kubelet service
+  systemd:
+    name: kubelet
+    enabled: yes
+    state: started
+
+# --- Idempotence / locks -------------------------------------------------------
+- name: Check if lock file exists
+  stat:
+    path: /tmp/kubeadm.lock
+  register: lock_file_stat
+
+- name: Check if cluster already initialized
+  stat:
+    path: /etc/kubernetes/admin.conf
+  register: admin_conf
+  when: inventory_hostname == "kubemaster"
+
+# --- IP d'API (sans dépendre d'un nom d'interface) -----------------------------
+# Optionnel: tu peux définir api_iface: ens3 dans l’inventaire; sinon on prend l’interface par défaut
+- name: Resolve API interface and address
+  set_fact:
+    api_iface: "{{ api_iface | default(ansible_facts.default_ipv4.interface) }}"
+    advertise_address: "{{ api_advertise_ip | default(ansible_facts.default_ipv4.address) }}"
+  when: inventory_hostname == "kubemaster"
+
+- name: Ensure hostname resolves to advertise IP (master)
+  lineinfile:
+    path: /etc/hosts
+    line: "{{ advertise_address }} {{ inventory_hostname }}"
+    state: present
+  when: inventory_hostname == "kubemaster"
+
+# --- kubeadm init (idempotent) -------------------------------------------------
+
+- name: Initialize Kubernetes (master)
+  become: true
+  command: "kubeadm init --apiserver-advertise-address={{ advertise_address }} --pod-network-cidr=10.244.0.0/16"
+  when:
+    - inventory_hostname == "kubemaster"
+    - not (admin_conf.stat.exists | default(false))
+    - not (lock_file_stat.stat.exists | default(false))
+  register: kubeadm_init
+  notify: lockfile
+
+- name: Set up kubeconfig for {{ user }} and root (master)
+  become: true
+  shell: |
+    mkdir -p /home/{{ user }}/.kube /root/.kube
+    cp -f /etc/kubernetes/admin.conf /home/{{ user }}/.kube/config
+    cp -f /etc/kubernetes/admin.conf /root/.kube/config
+    chown {{ user }}:{{ user }} /home/{{ user }}/.kube/config
+  when: inventory_hostname == "kubemaster" and not (lock_file_stat.stat.exists | default(false))
+
+# --- Join command (run once on master, diffusé à tous) -------------------------
+- name: Retrieve join command from master
+  command: kubeadm token create --print-join-command
+  register: join_cmd
+  run_once: true
+  delegate_to: kubemaster
+  
+- name: Distribute join command to all hosts
+  set_fact:
+    join_command_str: "{{ join_cmd.stdout }}"
+
+- name: Join worker nodes to the Kubernetes cluster
+  command: "{{ join_command_str }} --cri-socket /run/containerd/containerd.sock"
+  when:
+    - inventory_hostname in groups['workers']
+    - not (lock_file_stat.stat.exists | default(false))
+
+# --- Flannel (master uniquement) ----------------------------------------------
+- name: Ensure Flannel directory exists
+  file:
+    path: /run/flannel
+    state: directory
+    mode: '0755'
+
+- name: Ensure subnet.env file exists
+  file:
+    path: /run/flannel/subnet.env
+    state: touch
+    mode: '0644'
+
+- name: Add Flannel configuration to subnet.env
+  blockinfile:
+    path: /run/flannel/subnet.env
+    block: |
+      FLANNELD_IFACE={{ api_iface }}
+      FLANNEL_NETWORK=10.244.0.0/16
+      FLANNEL_SUBNET=10.244.0.1/24
+      FLANNEL_MTU=1450
+      FLANNEL_IPMASQ=true
+    marker: ""
+  when: inventory_hostname == "kubemaster"
+
+- name: Download kube-flannel.yml to /tmp (master)
+  get_url:
+    url: https://github.com/flannel-io/flannel/releases/download/v0.24.1/kube-flannel.yml
+    dest: /tmp/kube-flannel.yml
+    mode: '0644'
+  when: inventory_hostname == "kubemaster"
+
+- name: Inject iface arg for flannel (master, best-effort)
+  lineinfile:
+    path: /tmp/kube-flannel.yml
+    insertafter: '^(\s*)- --ip-masq'
+    line: '        - --iface={{ api_iface }}'
+  when: inventory_hostname == "kubemaster"
+
+- name: Apply the Flannel CNI plugin (master)
+  become: true
+  command: kubectl apply -f /tmp/kube-flannel.yml
+  when: inventory_hostname == "kubemaster" and not (lock_file_stat.stat.exists | default(false))
+
+# --- Services ------------------------------------------------------------------
+- name: Restart containerd
+  systemd:
+    name: containerd
+    state: restarted
+
+- name: Restart kubelet
+  systemd:
+    name: kubelet
+    state: restarted
+
+# --- Extra (lab files sur master) ---------------------------------------------
+- name: Create LAB dir if it does not exist (master)
+  ansible.builtin.file:
+    path: /home/{{ user }}/lab
+    state: directory
+    mode: '0755'
+  when: inventory_hostname == "kubemaster"
+
+- name: Copy all files (master)
+  copy:
+    src: "{{ item }}"
+    dest: /home/{{ user }}/lab
+  with_fileglob:
+    - "{{ role_path }}/files/*"
+  when: inventory_hostname == "kubemaster"
+
