@@ -34,13 +34,6 @@
     enabled: true
   become: true
 
-- name: Wait for firewalld socket to be ready
-  wait_for:
-    path: /run/firewalld.pid
-    state: present
-    timeout: 10
-  become: true
-
 # Master rules
 - name: FirewallD rules for Master
   firewalld:
@@ -91,16 +84,11 @@
 
 - name: Reload & restart firewalld
   block:
-    - name: Reload firewalld
-      command: firewall-cmd --reload
-      become: true
-
-    - name: Restart firewalld service
-      systemd:
+    - command: firewall-cmd --reload
+    - systemd:
         name: firewalld
         state: restarted
         enabled: yes
-      become: true
   become: true
 
 # --- SELinux & sysctl ----------------------------------------------------------
@@ -139,13 +127,6 @@
     name: br_netfilter
     state: present
   ignore_errors: true
-  become: true
-
-- name: Wait for /proc/sys/net/bridge files to appear
-  wait_for:
-    path: /proc/sys/net/bridge/bridge-nf-call-iptables
-    state: present
-    timeout: 10
   become: true
 
 - name: Apply sysctl settings for Kubernetes
@@ -190,13 +171,6 @@
     update_cache: yes
   become: true
 
-- name: Wait for containerd binary to be available
-  wait_for:
-    path: /usr/bin/containerd
-    state: present
-    timeout: 10
-  become: true
-  
 - name: Ensure /etc/containerd exists
   file:
     path: /etc/containerd
@@ -223,12 +197,5 @@
     name: containerd
     enabled: yes
     state: started
-  become: true
-
-- name: Wait for containerd socket to be ready
-  wait_for:
-    path: /run/containerd/containerd.sock
-    state: present
-    timeout: 15
   become: true
 
